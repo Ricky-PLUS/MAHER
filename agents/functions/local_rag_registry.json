@@ -1,0 +1,85 @@
+{
+  "functions": [
+    {
+      "name": "_compare_depth_to_camera",
+      "signature": "def _compare_depth_to_camera(image_path: str, bbox1: list, bbox2: list) -> int:",
+      "docstring": "Compares the depth (cz) of two objects to determine which is closer to the camera.\nArgs:\n    image_path (str): Absolute path to the image file on disk.\n    bbox1 (list): 2D bounding box [xmin, ymin, xmax, ymax] of the first object.\n    bbox2 (list): 2D bounding box [xmin, ymin, xmax, ymax] of the second object.\nReturns:\n    int: 0 if bbox1 is closer, 1 if bbox2 is closer, -1 if equal distances.",
+      "purpose": "Returns 0 if the first object is closer to the camera, 1 if the second is closer, -1 if they are at the same distance.",
+      "code_body": "def _compare_depth_to_camera(image_path: str, bbox1: list, bbox2: list) -> int:\n\n    pos1 = get_3d_position(image_path, bbox1)\n    pos2 = get_3d_position(image_path, bbox2)\n    cz1 = pos1[0][2]\n    cz2 = pos2[0][2]\n    if cz1 < cz2:\n        return 0\n    elif cz2 < cz1:\n        return 1\n    else:\n        return -1",
+      "status": "pending",
+      "source": "additional"
+    },
+    {
+      "name": "_compare_point_depth",
+      "signature": "def _compare_point_depth(image_path: str, point_a: list, point_b: list) -> int:",
+      "docstring": "Compares the depth (distance from camera) of two points in the image to determine which is closer.\nArgs:\n    image_path (str): Absolute path to the image file on disk.\n    point_a (list): The [x, y] coordinates of point A in pixel coordinates.\n    point_b (list): The [x, y] coordinates of point B in pixel coordinates.\nReturns:\n    int: 0 if point_a is closer, 1 if point_b is closer, -1 if equal distances.",
+      "purpose": "Compares the metric depth of two specified pixel points and returns 0 if the first point is closer, 1 if the second is closer, or -1 if equal.",
+      "code_body": "def _compare_point_depth(image_path: str, point_a: list, point_b: list) -> int:\n\n    depth_a = get_point_depth(image_path, point_a)\n    depth_b = get_point_depth(image_path, point_b)\n    if depth_a < depth_b:\n        return 0\n    elif depth_b < depth_a:\n        return 1\n    else:\n        return -1",
+      "status": "pending",
+      "source": "additional"
+    },
+    {
+      "name": "_get_3d_distance",
+      "signature": "def _get_3d_distance(image_path: str, bbox1: list, bbox2: list) -> float:",
+      "docstring": "Returns the Euclidean distance (in meters) between the 3D centers of two objects identified by their 2D bounding boxes.\nArgs:\n    image_path (str): Absolute path to the image file on disk.\n    bbox1 (list): 2D bounding box [xmin, ymin, xmax, ymax] of the first object.\n    bbox2 (list): 2D bounding box [xmin, ymin, xmax, ymax] of the second object.\nReturns:\n    float: The Euclidean distance in meters.",
+      "purpose": "Computes the absolute 3D Euclidean distance between two objects specified by their 2D bounding boxes.",
+      "code_body": "def _get_3d_distance(image_path: str, bbox1: list, bbox2: list) -> float:\n\n    import math\n\n    pos1 = get_3d_position(image_path, bbox1)\n    pos2 = get_3d_position(image_path, bbox2)\n\n    if pos1 is None or pos2 is None:\n        return 0.0\n\n    cx1, cy1, cz1 = pos1[0]\n    cx2, cy2, cz2 = pos2[0]\n\n    dx = cx2 - cx1\n    dy = cy2 - cy1\n    dz = cz2 - cz1\n\n    distance = math.sqrt(dx*dx + dy*dy + dz*dz)\n    return distance",
+      "status": "pending",
+      "source": "additional"
+    },
+    {
+      "name": "_get_horizontal_distance",
+      "signature": "def _get_horizontal_distance(image_path: str, bbox1: list, bbox2: list) -> float:",
+      "docstring": "Computes the absolute horizontal distance (difference in cx coordinates) between two objects.\nArgs:\n    image_path (str): Absolute path to the image file on disk.\n    bbox1 (list): 2D bounding box [xmin, ymin, xmax, ymax] of the first object.\n    bbox2 (list): 2D bounding box [xmin, ymin, xmax, ymax] of the second object.\nReturns:\n    float: The horizontal distance in meters (absolute difference).",
+      "purpose": "Computes the absolute horizontal distance between two objects given their 2D bounding boxes.",
+      "code_body": "def _get_horizontal_distance(image_path: str, bbox1: list, bbox2: list) -> float:\n\n    pos1 = get_3d_position(image_path, bbox1)\n    pos2 = get_3d_position(image_path, bbox2)\n    if pos1 is None or pos2 is None:\n        return 0.0\n    cx1 = pos1[0][0]\n    cx2 = pos2[0][0]\n    return abs(cx1 - cx2)",
+      "status": "pending",
+      "source": "additional"
+    },
+    {
+      "name": "_get_shortest_distance_between_objects",
+      "signature": "def _get_shortest_distance_between_objects(image_path: str, boundingbox1: list, boundingbox2: list) -> float:",
+      "docstring": "Computes the shortest surface distance between two 3D objects using their 2D bounding boxes (based on AABB assumption).\nArgs:\n    image_path (str): Absolute path to the image file on disk.\n    boundingbox1 (list): 2D bounding box [xmin, ymin, xmax, ymax] of the first object.\n    boundingbox2 (list): 2D bounding box [xmin, ymin, xmax, ymax] of the second object.\nReturns:\n    float: The shortest distance in meters. Returns 0.0 if objects intersect.",
+      "purpose": "Computes the shortest 3D surface distance between two objects given their 2D bounding boxes.",
+      "code_body": "def _get_shortest_distance_between_objects(image_path: str, boundingbox1: list, boundingbox2: list) -> float:\n\n    import math\n\n    pos1_res = get_3d_position(image_path, boundingbox1)\n    dim1_res = get_3d_dimensions(image_path, boundingbox1)\n\n    pos2_res = get_3d_position(image_path, boundingbox2)\n    dim2_res = get_3d_dimensions(image_path, boundingbox2)\n\n    cx1, cy1, cz1 = pos1_res[0]\n    dx1, dy1, dz1 = dim1_res[0]\n    \n    cx2, cy2, cz2 = pos2_res[0]\n    dx2, dy2, dz2 = dim2_res[0]\n    \n    dist_x = max(0.0, abs(cx1 - cx2) - (dx1 + dx2) / 2.0)\n    dist_y = max(0.0, abs(cy1 - cy2) - (dy1 + dy2) / 2.0)\n    dist_z = max(0.0, abs(cz1 - cz2) - (dz1 + dz2) / 2.0)\n\n    shortest_distance = math.sqrt(dist_x**2 + dist_y**2 + dist_z**2)\n    \n    return shortest_distance",
+      "status": "pending",
+      "source": "additional"
+    },
+    {
+      "name": "_get_object_height",
+      "signature": "def _get_object_height(image_path: str, boundingbox: list) -> float:",
+      "docstring": "Returns the height (dz) of an object specified by a 2D bounding box.\nArgs:\n    image_path (str): Absolute path to the image file on disk.\n    boundingbox (list): A 2D bounding box [xmin, ymin, xmax, ymax] in pixel coordinates.\nReturns:\n    float: The height of the object in meters.",
+      "purpose": "Returns the height (vertical dimension) of an object given its 2D bounding box.",
+      "code_body": "def _get_object_height(image_path: str, boundingbox: list) -> float:\n\n    result = get_3d_dimensions(image_path, boundingbox)\n    if result is None or len(result) == 0:\n        return 0.0\n    return result[0][2]",
+      "status": "pending",
+      "source": "additional"
+    },
+    {
+      "name": "_get_object_width",
+      "signature": "def _get_object_width(image_path: str, boundingbox: list) -> float:",
+      "docstring": "Returns the width (dy) of an object specified by a 2D bounding box, extracted from get_3d_dimensions.\n\nArgs:\n    image_path (str): Absolute path to the image file on disk.\n    boundingbox (list): A 2D bounding box [xmin, ymin, xmax, ymax] in pixel coordinates.\n\nReturns:\n    float: The width (dy) of the object in meters.",
+      "purpose": "Returns the width (dy) of an object given its 2D bounding box, extracted from get_3d_dimensions.",
+      "code_body": "def _get_object_width(image_path: str, boundingbox: list) -> float:\n\n\n    dims = get_3d_dimensions(image_path, boundingbox)\n    if dims is None or len(dims) == 0:\n        return 0.0\n    return dims[0][1]",
+      "status": "pending",
+      "source": "additional"
+    },
+    {
+      "name": "_get_point_depth_meters",
+      "signature": "def _get_point_depth_meters(image_path: str, point: list) -> float:",
+      "docstring": "Returns the metric depth (distance from camera in meters) of a specific point in the image.\n\nArgs:\n    image_path (str): Absolute path to the image file on disk.\n    point (list): The [x, y] coordinates of the target point in absolute pixel coordinates.\n\nReturns:\n    float: The metric depth of the point in meters from the camera.",
+      "purpose": "Returns the metric depth in meters of a specified pixel point in the image.",
+      "code_body": "def _get_point_depth_meters(image_path: str, point: list) -> float:\n\n    if point is None or len(point) != 2:\n        return 0.0\n    x, y = point\n    if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):\n        return 0.0\n    return get_point_depth(image_path, [float(x), float(y)])",
+      "status": "pending",
+      "source": "additional"
+    },
+    {
+      "name": "_get_vertical_distance",
+      "signature": "def _get_vertical_distance(image_path: str, bbox1: list, bbox2: list) -> float:",
+      "docstring": "Computes the absolute vertical distance (difference in cy from get_3d_position) between two objects.\n\nThis function uses the get_3d_position primitive to retrieve the 3D center coordinates of each object, then extracts the cy value (index 1) from the returned list to compute the absolute difference.\n\nArgs:\n    image_path (str): Absolute path to the image file on disk.\n    bbox1 (list): 2D bounding box [xmin, ymin, xmax, ymax] of the first object.\n    bbox2 (list): 2D bounding box [xmin, ymin, xmax, ymax] of the second object.\n\nReturns:\n    float: The absolute vertical distance in meters (|cy1 - cy2|).",
+      "purpose": "Computes the absolute vertical distance between two objects using their 3D center coordinates (cy values) obtained from their 2D bounding boxes.",
+      "code_body": "def _get_vertical_distance(image_path: str, bbox1: list, bbox2: list) -> float:\n\n\n    pos1 = get_3d_position(image_path, bbox1)\n    pos2 = get_3d_position(image_path, bbox2)\n    if not pos1 or not pos2 or len(pos1[0]) < 2 or len(pos2[0]) < 2:\n        return 0.0\n    cy1 = pos1[0][1]\n    cy2 = pos2[0][1]\n    return abs(cy1 - cy2)",
+      "status": "pending",
+      "source": "additional"
+    }
+  ]
+}

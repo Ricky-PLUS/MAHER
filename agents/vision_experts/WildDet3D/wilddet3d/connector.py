@@ -1,0 +1,1852 @@
+"""WildDet3D data connector and collator configuration.
+
+This module provides:
+1. DataConnector key mappings for train/test
+2. WildDet3DCollator: converts per-image DataLoader output to WildDet3DInput
+3. Point prompt sampling (from mask or box region)
+"""
+
+from __future__ import annotations
+
+import random
+import time
+from collections import defaultdict
+from typing import List, Literal, Optional
+
+import numpy as np
+import torch
+from torch import Tensor
+
+from wilddet3d.ops.profiler import profile_start, profile_stop
+
+from ml_collections import ConfigDict
+from vis4d.config import class_config
+from vis4d.data.const import CommonKeys as K
+from vis4d.engine.connectors import DataConnector, data_key, pred_key
+
+from wilddet3d.model import WildDet3DInput
+
+
+# ============================================================================
+# Point Sampling Utilities
+# ============================================================================
+
+def sample_points_from_mask(
+    mask: np.ndarray,
+    n_points: int,
+    mode: Literal["centered", "random_mask", "random_box"],
+    box: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Sample points from a binary mask.
+
+    Args:
+        mask: Binary mask (H, W), 1=foreground, 0=background
+        n_points: Number of points to sample
+        mode: Sampling mode
+            - "centered": sample from mask center (farthest from edges)
+            - "random_mask": uniform sample from mask interior
+            - "random_box": uniform sample from box, label from mask
+        box: Box in xyxy format (required for random_box mode)
+
+    Returns:
+        Points array (n_points, 3) with (x, y, label)
+    """
+    if mode == "centered":
+        return _center_positive_sample(mask, n_points)
+    elif mode == "random_mask":
+        return _uniform_positive_sample(mask, n_points)
+    elif mode == "random_box":
+        assert box is not None, "'random_box' mode requires a provided box."
+        return _uniform_sample_from_box(mask, box, n_points)
+    else:
+        raise ValueError(f"Unknown point sampling mode {mode}.")
+
+
+def _uniform_positive_sample(mask: np.ndarray, n_points: int) -> np.ndarray:
+    """Sample positive points uniformly from mask interior."""
+    mask_points = np.stack(np.nonzero(mask), axis=0).transpose(1, 0)
+    if len(mask_points) == 0:
+        # Empty mask, return center of image as fallback
+        h, w = mask.shape
+        return np.array([[w // 2, h // 2, 1]] * n_points)
+
+    selected_idxs = np.random.randint(low=0, high=len(mask_points), size=n_points)
+    selected_points = mask_points[selected_idxs]
+    selected_points = selected_points[:, ::-1]  # (y, x) -> (x, y)
+    labels = np.ones((len(selected_points), 1))
+    return np.concatenate([selected_points, labels], axis=1)
+
+
+def _center_positive_sample(mask: np.ndarray, n_points: int) -> np.ndarray:
+    """Sample points farthest from mask edges (using distance transform)."""
+    try:
+        import cv2
+    except ImportError:
+        # Fallback to uniform sampling if cv2 not available
+        return _uniform_positive_sample(mask, n_points)
+
+    if np.max(mask) == 0:
+        h, w = mask.shape
+        return np.array([[w // 2, h // 2, 1]] * n_points)
+
+    padded_mask = np.pad(mask.astype(np.uint8), 1)
+    points = []
+
+    for _ in range(n_points):
+        if np.max(padded_mask) == 0:
+            break
+        dist = cv2.distanceTransform(padded_mask, cv2.DIST_L2, 0)
+        point = np.unravel_index(dist.argmax(), dist.shape)
+        padded_mask[point[0], point[1]] = 0
+        points.append(point[::-1])  # (y, x) -> (x, y)
+
+    if len(points) == 0:
+        h, w = mask.shape
+        return np.array([[w // 2, h // 2, 1]] * n_points)
+
+    points = np.stack(points, axis=0)
+    points = points - 1  # Subtract padding offset
+    labels = np.ones((len(points), 1))
+    return np.concatenate([points, labels], axis=1)
+
+
+def _uniform_sample_from_box(
+    mask: np.ndarray,
+    box: np.ndarray,
+    n_points: int,
+) -> np.ndarray:
+    """Sample points uniformly from box, determine labels from mask."""
+    int_box = np.ceil(box).astype(int)
+    x1, y1, x2, y2 = int_box
+
+    # Ensure valid box
+    x2 = max(x2, x1 + 1)
+    y2 = max(y2, y1 + 1)
+
+    x = np.random.randint(low=x1, high=x2, size=n_points)
+    y = np.random.randint(low=y1, high=y2, size=n_points)
+
+    # Clip to mask boundaries
+    h, w = mask.shape
+    x = np.clip(x, 0, w - 1)
+    y = np.clip(y, 0, h - 1)
+
+    labels = mask[y, x]
+    return np.stack([x, y, labels], axis=1)
+
+
+def sample_points_without_mask(
+    box: np.ndarray,
+    n_positive: int,
+    n_negative: int,
+    H: int,
+    W: int,
+) -> np.ndarray:
+    """Sample points when no mask is available.
+
+    Uses box region as pseudo-mask:
+    - Positive points: uniformly from inside box
+    - Negative points: uniformly from outside box
+
+    Args:
+        box: Box in xyxy format (x1, y1, x2, y2)
+        n_positive: Number of positive points to sample
+        n_negative: Number of negative points to sample
+        H: Image height
+        W: Image width
+
+    Returns:
+        Points array (n_positive + n_negative, 3) with (x, y, label)
+    """
+    x1, y1, x2, y2 = map(int, box)
+
+    # Ensure valid box
+    x1 = max(0, min(x1, W - 1))
+    x2 = max(x1 + 1, min(x2, W))
+    y1 = max(0, min(y1, H - 1))
+    y2 = max(y1 + 1, min(y2, H))
+
+    points_list = []
+
+    # Positive points: inside box
+    if n_positive > 0:
+        pos_x = np.random.randint(x1, x2, size=n_positive)
+        pos_y = np.random.randint(y1, y2, size=n_positive)
+        pos_labels = np.ones(n_positive)
+        pos_points = np.stack([pos_x, pos_y, pos_labels], axis=1)
+        points_list.append(pos_points)
+
+    # Negative points: outside box
+    if n_negative > 0:
+        neg_points = []
+        max_attempts = n_negative * 100
+
+        for _ in range(max_attempts):
+            if len(neg_points) >= n_negative:
+                break
+            x = np.random.randint(0, W)
+            y = np.random.randint(0, H)
+            # Check if outside box
+            if not (x1 <= x < x2 and y1 <= y < y2):
+                neg_points.append([x, y, 0])
+
+        if len(neg_points) < n_negative:
+            # Fallback: sample from image corners if box is too large
+            corners = [(0, 0), (W-1, 0), (0, H-1), (W-1, H-1)]
+            while len(neg_points) < n_negative:
+                cx, cy = corners[len(neg_points) % 4]
+                neg_points.append([cx, cy, 0])
+
+        neg_points = np.array(neg_points[:n_negative])
+        points_list.append(neg_points)
+
+    if points_list:
+        return np.concatenate(points_list, axis=0)
+    else:
+        return np.zeros((0, 3))
+
+
+def noise_box(
+    box: np.ndarray,
+    im_size: tuple,
+    box_noise_std: float = 0.1,
+    box_noise_max: Optional[float] = None,
+    min_box_area: float = 0.0,
+) -> np.ndarray:
+    """Add noise to a box for data augmentation.
+
+    Follows SAM3's noise_box implementation:
+    - Gaussian noise scaled by box dimensions
+    - Optional pixel clamp
+    - Fallback to original box if area too small
+
+    Args:
+        box: Box in xyxy format (x1, y1, x2, y2)
+        im_size: Image size (H, W)
+        box_noise_std: Noise std relative to box size
+        box_noise_max: Max noise in pixels (None = no clamp)
+        min_box_area: Min area after noising (SAM3 default: 0.0)
+
+    Returns:
+        Noised box in xyxy format
+    """
+    if box_noise_std <= 0.0:
+        return box
+
+    noise = box_noise_std * np.random.randn(4)
+    w, h = box[2] - box[0], box[3] - box[1]
+    scale_factor = np.array([w, h, w, h])
+    noise = noise * scale_factor
+
+    if box_noise_max is not None:
+        noise = np.clip(noise, -box_noise_max, box_noise_max)
+
+    noised_box = box + noise
+
+    # Clamp to image bounds
+    H, W = im_size
+    noised_box = np.maximum(noised_box, 0)
+    noised_box = np.minimum(noised_box, [W, H, W, H])
+
+    # Check min area (SAM3 default: 0.0 = no limit)
+    new_w = noised_box[2] - noised_box[0]
+    new_h = noised_box[3] - noised_box[1]
+    if new_w * new_h <= min_box_area:
+        return box
+
+    return noised_box
+
+
+# ============================================================================
+# WildDet3D Collator
+# ============================================================================
+
+class WildDet3DCollator:
+    """Collator that converts per-image data to WildDet3DInput.
+
+    Design (SAM3 original - per-category queries):
+    - DataLoader produces per-image samples
+    - Collator groups GT boxes by category
+    - Each category creates ONE query with multi-instance targets
+    - This aligns with SAM3's multi-instance detection design
+
+    Per-prompt batch strategy:
+    - N_prompts = sum of unique categories across batch (NOT sum of boxes!)
+    - img_ids[i] indicates which image prompt i belongs to
+    - Each prompt can have multiple GT boxes (multi-instance targets)
+
+    Coordinate format:
+    - Input boxes2d: pixel xyxy (from dataset)
+    - geo_boxes: normalized cxcywh [0,1] (for SAM3)
+    - geo_points: normalized xy [0,1] (for SAM3)
+    - gt_boxes2d: normalized xyxy [0,1] (for loss)
+    - gt_boxes2d shape: (N_prompts, max_gts, 4) for multi-instance
+    - num_gts: (N_prompts,) number of GT boxes per query (can be > 1)
+
+    Text/Visual Query:
+    - text_query_prob controls the ratio of text vs visual queries
+    - text_query_prob=1.0: all text queries (SAM3 default for training)
+    - text_query_prob=0.7: 70% text, 30% visual (recommended by SAM3)
+    - Visual queries use one randomly selected target box as geo_box
+    """
+
+    def __init__(
+        self,
+        max_prompts_per_image: int = 50,
+        use_text_prompts: bool = True,
+        default_text: str = "visual",
+        # Point prompt options
+        use_point_prompts: bool = False,
+        num_positive_points: int | tuple[int, int] = 1,
+        num_negative_points: int | tuple[int, int] = 0,
+        point_sample_mode: Literal["centered", "random_mask", "random_box"] = "random_mask",
+        # Box prompt options
+        use_box_prompts: bool = True,
+        box_noise_std: float = 0.0,
+        box_noise_max: float | None = None,
+        # Multi-tier box noise: (prob, std) tiers sampled per box.
+        # If set, overrides box_noise_std. Each tier is (probability, std).
+        # Probabilities must sum to 1.0.
+        # Example: [(0.3, 0.0), (0.5, 0.1), (0.2, 0.2)]
+        #   = 30% no noise, 50% mild, 20% extreme
+        box_noise_tiers: list[tuple[float, float]] | None = None,
+        # Text/Visual query ratio (SAM3 original design)
+        text_query_prob: float = 0.7,  # 70% text, 30% visual (SAM3 recommended)
+        keep_text_for_visual: bool = False,  # If True, visual queries keep category text
+        # Geometry prompt options (text + geometry training)
+        use_geometry_prompts: bool = False,  # If True, create 2 queries per category
+        geometric_query_str: str = "geometric",  # Text for geometry queries
+        visual_query_str: str = "visual",  # Text for visual queries
+        # 5-mode training: Branch 1 and Branch 2 probabilities
+        # Branch 1 (o2m): TEXT (text_only_prob) / VISUAL or VISUAL+LABEL (1-text_only_prob)
+        # Branch 2 (o2o): GEOMETRY or GEOMETRY+LABEL
+        # use_label_prob controls +LABEL variants for both branches
+        text_only_prob: float = 0.5,  # Branch 1: P(TEXT) vs P(box-based query)
+        use_label_prob: float = 1/3,  # P(+LABEL) when query has a box prompt
+        # Oracle evaluation mode (GT box as geometry prompt)
+        oracle_eval: bool = False,  # If True, each GT box = one geometry prompt
+        oracle_text_category: bool = False,  # If True, oracle + category text
+        # Point prompt: SAM3-style box/point budget (only when use_point_prompts=True)
+        # num_points is the total geometric prompt budget.
+        # box_chance controls probability of including a box (which takes 1 slot).
+        # E.g. num_points=(1,3), box_chance=0.5:
+        #   num=1, box=True → pure box | num=1, box=False → 1 point
+        #   num=2, box=True → box+1pt  | num=2, box=False → 2 points
+        #   num=3, box=True → box+2pt  | num=3, box=False → 3 points
+        box_chance: float = 0.5,
+        # Exclusive point mode probability. When use_point_prompts=True,
+        # Branch 2 randomly picks EITHER box-only OR point-only (never
+        # both). Point-only is chosen with probability point_mode_prob,
+        # but only when the selected box has a mask (masks2d_rle).
+        # Otherwise box-only. Points use SAM3 random_box mode: uniform
+        # from box region, mask determines pos/neg labels.
+        point_mode_prob: float = 0.3,
+        # Negative sampling (SAM3 style)
+        include_negatives: bool = False,  # Add negative queries (absent categories)
+        max_negatives_per_image: int = 5,  # Max negative queries per image
+        # Training vs inference filtering
+        filter_empty_boxes: bool = True,  # Set False at test time to keep 0-GT-box images
+    ):
+        """Initialize collator.
+
+        Args:
+            max_prompts_per_image: Max number of prompts (categories) per image
+            use_text_prompts: Whether to include text with geometric prompts
+            default_text: Default text when class name not available
+            use_point_prompts: Whether to sample point prompts (for ablation)
+            num_positive_points: Number of positive points to sample
+                Can be int or (min, max) tuple for random range
+            num_negative_points: Number of negative points to sample
+                Can be int or (min, max) tuple for random range
+            point_sample_mode: How to sample points when mask is available
+                - "centered": sample from mask center (farthest from edges)
+                - "random_mask": uniform sample from mask interior
+                - "random_box": uniform sample from box, label from mask
+            use_box_prompts: Whether to use box prompts
+            box_noise_std: Noise std for box jittering (0 = no noise)
+            box_noise_max: Max noise in pixels (None = no clamp)
+            box_noise_tiers: Multi-tier noise as list of (prob, std).
+                Overrides box_noise_std when set.
+            text_query_prob: Probability of text-only queries (SAM3 recommended: 0.7)
+                Only used when use_geometry_prompts=False (legacy 2-mode).
+            keep_text_for_visual: If True, visual queries keep category text
+                If False (default), visual queries use "visual" as text.
+                Only used when use_geometry_prompts=False (legacy 2-mode).
+            use_geometry_prompts: If True, 5-mode training with 2 queries
+                per category (Branch 1 o2m + Branch 2 o2o).
+            geometric_query_str: Text for geometry queries (default "geometric")
+            visual_query_str: Text for visual queries (default "visual")
+            text_only_prob: Branch 1 probability of TEXT mode (no box).
+                Remaining (1-text_only_prob) is box-based (VISUAL or VISUAL+LABEL).
+            use_label_prob: Probability of +LABEL variant when query has a box.
+                Controls both Branch 1 (VISUAL vs VISUAL+LABEL) and
+                Branch 2 (GEOMETRY vs GEOMETRY+LABEL).
+                +LABEL format: "visual: car" / "geometric: car".
+            oracle_eval: If True, each GT 2D box becomes its own geometry
+                prompt (one-to-one). For measuring 3D regression quality
+                in isolation, following DetAny3D's GT prompt evaluation.
+            oracle_text_category: If True, oracle mode with category text.
+                Each GT box = one GEOMETRY+LABEL prompt with text
+                "geometric: <category>" (e.g., "geometric: apple").
+        """
+        self.max_prompts_per_image = max_prompts_per_image
+        self.use_text_prompts = use_text_prompts
+        self.default_text = default_text
+
+        # Point prompt options
+        self.use_point_prompts = use_point_prompts
+        self.num_positive_points = num_positive_points
+        self.num_negative_points = num_negative_points
+        self.point_sample_mode = point_sample_mode
+
+        # Box prompt options
+        self.use_box_prompts = use_box_prompts
+        self.box_noise_std = box_noise_std
+        self.box_noise_max = box_noise_max
+        self.box_noise_tiers = box_noise_tiers
+
+        # Text/Visual query ratio
+        self.text_query_prob = text_query_prob
+        self.keep_text_for_visual = keep_text_for_visual
+
+        # Geometry prompt options (5-mode training)
+        self.use_geometry_prompts = use_geometry_prompts
+        self.geometric_query_str = geometric_query_str
+        self.visual_query_str = visual_query_str
+        self.text_only_prob = text_only_prob
+        self.use_label_prob = use_label_prob
+
+        # Oracle evaluation mode
+        self.oracle_eval = oracle_eval
+        self.oracle_text_category = oracle_text_category
+
+        # Point prompt: box/point budget
+        self.box_chance = box_chance
+        self.point_mode_prob = point_mode_prob
+
+        # Negative sampling (SAM3 style presence loss training)
+        self.include_negatives = include_negatives
+        self.max_negatives_per_image = max_negatives_per_image
+
+        # Training vs inference filtering
+        self.filter_empty_boxes = filter_empty_boxes
+
+    def _sample_box_noise_std(self) -> float:
+        """Sample box noise std from tiers or fallback to self.box_noise_std."""
+        if self.box_noise_tiers is not None:
+            r = random.random()
+            cumulative = 0.0
+            for prob, std in self.box_noise_tiers:
+                cumulative += prob
+                if r < cumulative:
+                    return std
+            return self.box_noise_tiers[-1][1]
+        return self.box_noise_std
+
+    def _sample_num_points(self, num_spec: int | tuple[int, int]) -> int:
+        """Sample number of points from spec."""
+        if isinstance(num_spec, int):
+            return num_spec
+        else:
+            low, high = num_spec
+            return np.random.randint(low, high + 1)
+
+    def _sample_points_for_box(
+        self,
+        box_xyxy: np.ndarray,
+        mask: Optional[np.ndarray],
+        H: int,
+        W: int,
+    ) -> np.ndarray:
+        """Sample points for a single box.
+
+        Args:
+            box_xyxy: Box in pixel xyxy format
+            mask: Optional binary mask (H, W)
+            H, W: Image dimensions
+
+        Returns:
+            Points array (N, 3) with (x, y, label) in pixel coords
+        """
+        n_pos = self._sample_num_points(self.num_positive_points)
+        n_neg = self._sample_num_points(self.num_negative_points)
+
+        if mask is not None:
+            # Sample from actual mask
+            points = sample_points_from_mask(
+                mask, n_pos + n_neg, self.point_sample_mode, box_xyxy
+            )
+        else:
+            # Use box as pseudo-mask
+            points = sample_points_without_mask(box_xyxy, n_pos, n_neg, H, W)
+
+        return points
+
+    def _sample_geo_budget(self) -> tuple[int, bool]:
+        """Sample geometric prompt budget (SAM3 style).
+
+        Returns:
+            (n_points, use_box): number of point prompts and whether to
+            include a box. Box takes 1 slot from the total budget.
+        """
+        n_total = self._sample_num_points(self.num_positive_points)
+        if self.box_chance > 0:
+            use_box = random.random() < self.box_chance
+            n_points = max(n_total - int(use_box), 0)
+        else:
+            use_box = False
+            n_points = n_total
+        return n_points, use_box
+
+    def _sample_points_normalized(
+        self,
+        box_xyxy_pixel: np.ndarray,
+        n_points: int,
+        H: int,
+        W: int,
+        mask: Optional[np.ndarray] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sample n_points from box region, return normalized coords + labels.
+
+        Returns:
+            pts_xy: (n_points, 2) normalized [0,1]
+            pts_labels: (n_points,) long, 1=positive 0=negative
+        """
+        if n_points <= 0:
+            return None, None
+        if mask is not None:
+            points = sample_points_from_mask(
+                mask, n_points, self.point_sample_mode, box_xyxy_pixel
+            )
+        else:
+            points = sample_points_without_mask(
+                box_xyxy_pixel, n_points, 0, H, W
+            )
+        pts_xy = torch.tensor(
+            points[:, :2] / np.array([W, H]),
+            dtype=torch.float32,
+        )
+        pts_labels = torch.tensor(points[:, 2], dtype=torch.long)
+        return pts_xy, pts_labels
+
+    def __call__(self, batch: List[dict]) -> WildDet3DInput:
+        """Collate batch of per-image samples to WildDet3DInput.
+
+        Args:
+            batch: List of dicts, each containing:
+                - images: (3, H, W)
+                - boxes2d: (N_i, 4) pixel xyxy
+                - boxes2d_classes: (N_i,) class indices
+                - boxes2d_names: List[str] class names (optional)
+                - boxes3d: (N_i, 7+) 3D box params
+                - intrinsics: (3, 3)
+                - masks2d: (N_i, H, W) binary masks (optional)
+
+        Returns:
+            WildDet3DInput with per-prompt batch
+        """
+        profile_start("  collator_total")
+
+        # Filter out images with no GT boxes to avoid empty prompts.
+        # Only applied during training; at test time we keep all images so
+        # that the evaluator receives predictions for every image (even ones
+        # with 0 valid 3D GT boxes).  _forward_test already handles the
+        # n_prompts_this_img==0 case by returning empty tensors.
+        original_batch_size = len(batch)
+        if self.filter_empty_boxes:
+            batch = [
+                item for item in batch
+                if item.get("boxes2d") is not None and len(item["boxes2d"]) > 0
+            ]
+
+        # if len(batch) < original_batch_size:
+        #     import torch.distributed as dist
+        #     rank = dist.get_rank() if dist.is_initialized() else 0
+        #     filtered_count = original_batch_size - len(batch)
+        #     print(
+        #         f"[WildDet3DCollator] Filtered {filtered_count}/{original_batch_size} "
+        #         f"empty images on rank {rank}"
+        #     )
+
+        B = len(batch)
+
+        # Handle completely empty batch (all images filtered out)
+        if B == 0:
+            # import torch.distributed as dist
+            # rank = dist.get_rank() if dist.is_initialized() else 0
+            # print(
+            #     f"[WildDet3DCollator] WARNING: Entire batch empty after filtering "
+            #     f"({original_batch_size} images all had 0 GT boxes) on rank {rank}"
+            # )
+            # Return minimal empty batch - model will handle this gracefully
+            return WildDet3DInput(
+                images=torch.zeros(0, 3, 1, 1),  # (0, 3, H, W)
+                intrinsics=torch.zeros(0, 3, 3),  # (0, 3, 3)
+                img_ids=torch.zeros(0, dtype=torch.long),
+                text_ids=torch.zeros(0, dtype=torch.long),
+                unique_texts=[self.default_text],
+                sample_names=None,
+                dataset_name=None,
+                original_hw=None,
+                original_images=None,
+                original_intrinsics=None,
+                padding=None,
+            )
+
+        device = batch[0]["images"].device if batch[0]["images"].is_cuda else "cpu"
+
+        # Collect image-level data
+        profile_start("  collator_image_stack")
+        # Images might be (3, H, W) or (1, 3, H, W) depending on data pipeline
+        images_list = []
+        for b in batch:
+            img = b["images"]
+            # Handle case where img might have extra batch dim
+            if img.dim() == 4 and img.shape[0] == 1:
+                img = img.squeeze(0)  # (1, 3, H, W) -> (3, H, W)
+            images_list.append(img)
+        images = torch.stack(images_list)  # (B, 3, H, W)
+        intrinsics = torch.stack([b["intrinsics"] for b in batch])  # (B, 3, 3)
+        H, W = images.shape[-2:]  # Use -2: and -1 for H, W to be safe
+        profile_stop("  collator_image_stack")
+
+        # Collect metadata for evaluation/visualization
+        sample_names = []
+        dataset_name_list = []
+        original_hw_list = []
+        original_images_list = []
+        original_intrinsics_list = []
+        padding_list = []
+        for b_idx, b in enumerate(batch):
+            # sample_names - image identifier for evaluation
+            if "sample_names" in b:
+                sample_names.append(b["sample_names"])
+            elif "image_id" in b:
+                sample_names.append(b["image_id"])
+            else:
+                sample_names.append(None)
+
+            # dataset_name - for evaluator to route to correct dataset
+            if "dataset_name" in b:
+                dataset_name_list.append(b["dataset_name"])
+            else:
+                dataset_name_list.append(None)
+
+            # original_hw - for coordinate scaling back
+            if "original_hw" in b:
+                original_hw_list.append(b["original_hw"])
+            else:
+                original_hw_list.append(None)
+
+            # original_images - unresized images for visualization
+            if "original_images" in b:
+                original_images_list.append(b["original_images"])
+            else:
+                original_images_list.append(None)
+
+            # original_intrinsics - intrinsics before resize
+            if "original_intrinsics" in b:
+                original_intrinsics_list.append(b["original_intrinsics"])
+            else:
+                original_intrinsics_list.append(None)
+
+            # padding - CenterPad offsets [pad_left, pad_right, pad_top, pad_bottom]
+            if "padding" in b:
+                padding_list.append(b["padding"])
+            else:
+                padding_list.append(None)
+
+        # Collect depth maps for geometry backend supervision
+        depth_maps_list = []
+        for b in batch:
+            # depth_maps - K.depth_maps key from dataset
+            if "depth_maps" in b and b["depth_maps"] is not None:
+                depth_maps_list.append(b["depth_maps"])
+            else:
+                depth_maps_list.append(None)
+
+        # Stack depth maps if available (all images must have depth)
+        depth_gt = None
+        if depth_maps_list and all(d is not None for d in depth_maps_list):
+            try:
+                depth_gt = torch.stack(depth_maps_list, dim=0)  # (B, H, W) or (B, 1, H, W)
+                if depth_gt.dim() == 3:
+                    depth_gt = depth_gt.unsqueeze(1)  # (B, H, W) -> (B, 1, H, W)
+            except (RuntimeError, TypeError):
+                depth_gt = None
+
+        # Convert to proper format (None if all are None)
+        sample_names = sample_names if any(s is not None for s in sample_names) else None
+        dataset_name = dataset_name_list if any(d is not None for d in dataset_name_list) else None
+        original_hw = original_hw_list if any(h is not None for h in original_hw_list) else None
+        padding = padding_list if any(p is not None for p in padding_list) else None
+        original_images = None
+        if any(img is not None for img in original_images_list):
+            # Convert numpy arrays to tensors, then try stacking.
+            # Different-sized images (e.g. cross-dataset) cannot be stacked;
+            # in that case keep as list for the visualizer.
+            imgs = []
+            for img in original_images_list:
+                if img is None:
+                    continue
+                if not isinstance(img, torch.Tensor):
+                    img = torch.as_tensor(img)
+                imgs.append(img)
+            if len(imgs) == 1:
+                original_images = imgs[0].unsqueeze(0) if imgs[0].dim() == 3 else imgs[0]
+            elif len(imgs) > 1:
+                try:
+                    original_images = torch.stack(imgs)
+                except RuntimeError:
+                    # Different shapes across batch - keep first only
+                    original_images = imgs[0].unsqueeze(0) if imgs[0].dim() == 3 else imgs[0]
+        original_intrinsics = None
+        if any(intr is not None for intr in original_intrinsics_list):
+            intrs = []
+            for intr in original_intrinsics_list:
+                if intr is None:
+                    continue
+                if not isinstance(intr, torch.Tensor):
+                    intr = torch.as_tensor(intr)
+                intrs.append(intr)
+            try:
+                original_intrinsics = torch.stack(intrs)
+            except (RuntimeError, TypeError):
+                original_intrinsics = None
+
+        # Build per-prompt data (SAM3 original: per-category queries)
+        # If use_geometry_prompts=True: Each category creates TWO queries
+        #   - TEXT query (one-to-many targets)
+        #   - GEOMETRY query (one-to-one target)
+        # If use_geometry_prompts=False: Original behavior (text or visual per category)
+        img_ids_list = []
+        text_ids_list = []
+        geo_boxes_list = []  # normalized cxcywh (for visual/geometry queries)
+        geo_points_list = []  # normalized xy (N, 2) or None
+        geo_point_labels_list = []  # labels (N,) or None
+        is_visual_query_list = []  # Track which queries have visual prompts
+        # Query types (collator-level label only, does NOT control SAM3 internal matching):
+        # 0=TEXT, 1=VISUAL, 2=GEOMETRY, 3=VISUAL+LABEL, 4=GEOMETRY+LABEL
+        query_types_list = []
+
+        # Multi-instance targets: list of lists
+        # gt_boxes2d_per_query[i] = list of normalized xyxy boxes for query i
+        gt_boxes2d_per_query = []
+        gt_boxes3d_per_query = []
+        gt_category_ids_list = []
+
+        # Ignore boxes per query (for negative loss suppression)
+        ignore_boxes2d_per_query = []
+
+        # Build unique text list
+        unique_texts = []
+        text_to_id = {}
+
+        # Helper function to normalize box to xyxy [0,1]
+        def normalize_box_xyxy(box_xyxy_raw):
+            if isinstance(box_xyxy_raw, torch.Tensor):
+                gt_box_norm = box_xyxy_raw.clone().float()
+            else:
+                gt_box_norm = torch.tensor(box_xyxy_raw, dtype=torch.float32)
+            gt_box_norm[0::2] /= W
+            gt_box_norm[1::2] /= H
+            return gt_box_norm.to(device)
+
+        # Helper function to convert xyxy to cxcywh
+        def xyxy_to_cxcywh(box_norm_xyxy):
+            cx = (box_norm_xyxy[0] + box_norm_xyxy[2]) / 2
+            cy = (box_norm_xyxy[1] + box_norm_xyxy[3]) / 2
+            w_box = box_norm_xyxy[2] - box_norm_xyxy[0]
+            h_box = box_norm_xyxy[3] - box_norm_xyxy[1]
+            return torch.tensor([cx, cy, w_box, h_box], device=device)
+
+        profile_start("  collator_category_group")
+
+        if self.oracle_eval:
+            # ========== Oracle Mode: Each GT box = one geometry prompt ==========
+            # Following DetAny3D's GT prompt evaluation approach.
+            # One-to-one mapping: each GT box becomes a separate geometry
+            # prompt, model predicts 3D for each box independently.
+            geo_text = self.geometric_query_str
+            if geo_text not in text_to_id:
+                text_to_id[geo_text] = len(unique_texts)
+                unique_texts.append(geo_text)
+            geo_text_id = text_to_id[geo_text]
+
+            for img_idx, sample in enumerate(batch):
+                boxes2d = sample.get("boxes2d")
+                boxes3d = sample.get("boxes3d")
+                class_ids = sample.get("boxes2d_classes")
+
+                if boxes2d is None or len(boxes2d) == 0:
+                    continue
+
+                # During test, boxes2d are in original pixel space (test
+                # transforms don't include ResizeBoxes2D / CenterPadBoxes2D).
+                # Transform to padded pixel space using the SAME math as
+                # _forward_test's inverse (subtract pad, divide scale), reversed:
+                #   original -> padded: x * scale_x + pad_left
+                # where scale_x = content_w / orig_w (from _forward_test)
+                original_hw = sample.get("original_hw", None)
+                pad_info = sample.get("padding", None)
+
+                if original_hw is not None and pad_info is not None:
+                    orig_h, orig_w = original_hw
+                    if isinstance(orig_h, torch.Tensor):
+                        orig_h, orig_w = orig_h.item(), orig_w.item()
+                    pad_left, pad_right, pad_top, pad_bottom = pad_info
+                    if isinstance(pad_left, torch.Tensor):
+                        pad_left = pad_left.item()
+                        pad_right = pad_right.item()
+                        pad_top = pad_top.item()
+                        pad_bottom = pad_bottom.item()
+                    content_w = W - pad_left - pad_right
+                    content_h = H - pad_top - pad_bottom
+                    scale_x = content_w / orig_w
+                    scale_y = content_h / orig_h
+
+                    def transform_box_to_padded(box_raw):
+                        """Transform box: original pixel -> padded pixel."""
+                        if isinstance(box_raw, torch.Tensor):
+                            box = box_raw.clone().float()
+                        else:
+                            box = torch.tensor(box_raw, dtype=torch.float32)
+                        box[0::2] = box[0::2] * scale_x + pad_left
+                        box[1::2] = box[1::2] * scale_y + pad_top
+                        return box
+                else:
+                    def transform_box_to_padded(box_raw):
+                        if isinstance(box_raw, torch.Tensor):
+                            return box_raw.clone().float()
+                        return torch.tensor(box_raw, dtype=torch.float32)
+
+                for box_idx in range(len(boxes2d)):
+                    img_ids_list.append(img_idx)
+
+                    # Category ID
+                    if class_ids is not None:
+                        cat_id = class_ids[box_idx]
+                        if isinstance(cat_id, torch.Tensor):
+                            cat_id = cat_id.item()
+                    else:
+                        cat_id = 0
+                    gt_category_ids_list.append(cat_id)
+
+                    # Geometry query type
+                    query_types_list.append(2)  # GEOMETRY
+                    is_visual_query_list.append(True)
+                    text_ids_list.append(geo_text_id)
+
+                    # Transform box to padded pixel space, then normalize
+                    box_padded = transform_box_to_padded(boxes2d[box_idx])
+                    box_norm_xyxy = normalize_box_xyxy(box_padded)
+                    geo_boxes_list.append(xyxy_to_cxcywh(box_norm_xyxy))
+                    geo_points_list.append(None)
+                    geo_point_labels_list.append(None)
+
+                    # Target = this single box (one-to-one)
+                    gt_boxes2d_per_query.append(
+                        [normalize_box_xyxy(boxes2d[box_idx])]
+                    )
+                    if boxes3d is not None and box_idx < len(boxes3d):
+                        gt_boxes3d_per_query.append(
+                            [boxes3d[box_idx].to(device)]
+                        )
+                    else:
+                        gt_boxes3d_per_query.append(None)
+                    # Oracle mode: no ignore box suppression needed
+                    ignore_boxes2d_per_query.append([])
+
+        elif self.oracle_text_category:
+            # ========== Oracle + Text Category Mode ==========
+            # Same as oracle (each GT box = one geometry prompt), but with
+            # category-specific text: "geometric: <category>" instead of
+            # generic "geometric". Query type = GEOMETRY+LABEL (4).
+            for img_idx, sample in enumerate(batch):
+                boxes2d = sample.get("boxes2d")
+                boxes3d = sample.get("boxes3d")
+                class_ids = sample.get("boxes2d_classes")
+                class_names = sample.get("boxes2d_names", None)
+
+                if boxes2d is None or len(boxes2d) == 0:
+                    continue
+
+                original_hw = sample.get("original_hw", None)
+                pad_info = sample.get("padding", None)
+
+                if original_hw is not None and pad_info is not None:
+                    orig_h, orig_w = original_hw
+                    if isinstance(orig_h, torch.Tensor):
+                        orig_h, orig_w = orig_h.item(), orig_w.item()
+                    pad_left, pad_right, pad_top, pad_bottom = pad_info
+                    if isinstance(pad_left, torch.Tensor):
+                        pad_left = pad_left.item()
+                        pad_right = pad_right.item()
+                        pad_top = pad_top.item()
+                        pad_bottom = pad_bottom.item()
+                    content_w = W - pad_left - pad_right
+                    content_h = H - pad_top - pad_bottom
+                    scale_x = content_w / orig_w
+                    scale_y = content_h / orig_h
+
+                    def transform_box_to_padded(box_raw):
+                        """Transform box: original pixel -> padded pixel."""
+                        if isinstance(box_raw, torch.Tensor):
+                            box = box_raw.clone().float()
+                        else:
+                            box = torch.tensor(box_raw, dtype=torch.float32)
+                        box[0::2] = box[0::2] * scale_x + pad_left
+                        box[1::2] = box[1::2] * scale_y + pad_top
+                        return box
+                else:
+                    def transform_box_to_padded(box_raw):
+                        if isinstance(box_raw, torch.Tensor):
+                            return box_raw.clone().float()
+                        return torch.tensor(box_raw, dtype=torch.float32)
+
+                for box_idx in range(len(boxes2d)):
+                    img_ids_list.append(img_idx)
+
+                    # Category ID
+                    if class_ids is not None:
+                        cat_id = class_ids[box_idx]
+                        if isinstance(cat_id, torch.Tensor):
+                            cat_id = cat_id.item()
+                    else:
+                        cat_id = 0
+                    gt_category_ids_list.append(cat_id)
+
+                    # Get category name
+                    if class_names is not None and cat_id < len(class_names):
+                        cat_name = class_names[cat_id]
+                    else:
+                        cat_name = self.default_text
+
+                    # GEOMETRY+LABEL query: "geometric: <category>"
+                    gl_text = f"{self.geometric_query_str}: {cat_name}"
+                    if gl_text not in text_to_id:
+                        text_to_id[gl_text] = len(unique_texts)
+                        unique_texts.append(gl_text)
+                    query_types_list.append(4)  # GEOMETRY+LABEL
+                    is_visual_query_list.append(True)
+                    text_ids_list.append(text_to_id[gl_text])
+
+                    # Transform box to padded pixel space, then normalize
+                    box_padded = transform_box_to_padded(boxes2d[box_idx])
+                    box_norm_xyxy = normalize_box_xyxy(box_padded)
+                    geo_boxes_list.append(xyxy_to_cxcywh(box_norm_xyxy))
+                    geo_points_list.append(None)
+                    geo_point_labels_list.append(None)
+
+                    # Target = this single box (one-to-one)
+                    gt_boxes2d_per_query.append(
+                        [normalize_box_xyxy(boxes2d[box_idx])]
+                    )
+                    if boxes3d is not None and box_idx < len(boxes3d):
+                        gt_boxes3d_per_query.append(
+                            [boxes3d[box_idx].to(device)]
+                        )
+                    else:
+                        gt_boxes3d_per_query.append(None)
+                    ignore_boxes2d_per_query.append([])
+
+        else:
+            # ========== Standard Mode: Group by category ==========
+            for img_idx, sample in enumerate(batch):
+                boxes2d = sample.get("boxes2d")  # (N_i, 4) pixel xyxy
+                boxes3d = sample.get("boxes3d")  # (N_i, 7+)
+                class_ids = sample.get("boxes2d_classes")  # (N_i,)
+                class_names = sample.get("boxes2d_names", None)  # List[str] or None
+                masks2d = sample.get("masks2d", None)  # (N_i, H, W) or None
+
+                if boxes2d is None or len(boxes2d) == 0:
+                    continue
+
+                # ========== SAM3 Original: Group boxes by category ==========
+                cat_to_box_indices = defaultdict(list)
+                for box_idx in range(len(boxes2d)):
+                    if class_ids is not None:
+                        cat_id = class_ids[box_idx]
+                        if isinstance(cat_id, torch.Tensor):
+                            cat_id = cat_id.item()
+                    else:
+                        cat_id = 0
+                    cat_to_box_indices[cat_id].append(box_idx)
+
+                # Group ignore boxes by category (for negative loss suppression)
+                ignore_boxes2d_raw = sample.get("ignore_boxes2d", None)
+                ignore_class_ids_raw = sample.get("ignore_class_ids", None)
+                cat_to_ignore_indices = defaultdict(list)
+                if (
+                    ignore_boxes2d_raw is not None
+                    and len(ignore_boxes2d_raw) > 0
+                ):
+                    for ign_idx in range(len(ignore_boxes2d_raw)):
+                        ign_cat_id = int(ignore_class_ids_raw[ign_idx])
+                        cat_to_ignore_indices[ign_cat_id].append(ign_idx)
+
+                # Limit number of categories (queries) per image
+                categories = list(cat_to_box_indices.keys())
+                if len(categories) > self.max_prompts_per_image:
+                    random.shuffle(categories)
+                    categories = categories[:self.max_prompts_per_image]
+
+                # ========== Create queries per category ==========
+                for cat_id in categories:
+                    box_indices = cat_to_box_indices[cat_id]
+
+                    # Get category name for text
+                    if self.use_text_prompts and class_names is not None:
+                        cat_name = class_names[cat_id] if cat_id < len(class_names) else self.default_text
+                    else:
+                        cat_name = self.default_text
+
+                    if self.use_geometry_prompts:
+                        # ========== 5-Mode Training ==========
+                        # Creates 2 queries per category:
+                        #
+                        # Branch 1 ("multi-target"): target = ALL instances of this category
+                        #   - TEXT:         text="car",          no box
+                        #   - VISUAL:       text="visual",       geo_box
+                        #   - VISUAL+LABEL: text="visual: car",  geo_box
+                        #
+                        # Branch 2 ("single-target"): target = 1 selected instance only
+                        #   - GEOMETRY:       text="geometric",       geo_box
+                        #   - GEOMETRY+LABEL: text="geometric: car",  geo_box
+                        #
+                        # NOTE on "multi-target" vs "single-target":
+                        # This refers to how many GT boxes are assigned as
+                        # targets in this collator (num_gts). This is DIFFERENT
+                        # from SAM3's internal o2o/o2m matching (DAC mechanism).
+                        # SAM3's DAC always runs both Hungarian (o2o) and
+                        # one-to-many (o2m) matchers in the decoder regardless
+                        # of how many GT targets we assign here.
+
+                        # Helper: add text to unique_texts and return its id
+                        def _get_text_id(text_str):
+                            if text_str not in text_to_id:
+                                text_to_id[text_str] = len(unique_texts)
+                                unique_texts.append(text_str)
+                            return text_to_id[text_str]
+
+                        # Helper: select a random GT box and return its
+                        # normalized cxcywh (with optional noise)
+                        def _make_geo_box(box_indices_inner):
+                            sel_idx = random.choice(box_indices_inner)
+                            bx = boxes2d[sel_idx]
+                            bx_np = bx.cpu().numpy() if isinstance(bx, torch.Tensor) else bx
+                            std = self._sample_box_noise_std()
+                            if std > 0:
+                                bx_np = noise_box(
+                                    bx_np,
+                                    im_size=(H, W),
+                                    box_noise_std=std,
+                                    box_noise_max=self.box_noise_max,
+                                )
+                            norm_xyxy = torch.tensor([
+                                bx_np[0] / W, bx_np[1] / H,
+                                bx_np[2] / W, bx_np[3] / H,
+                            ], dtype=torch.float32, device=device)
+                            return sel_idx, xyxy_to_cxcywh(norm_xyxy)
+
+                        # ----- Branch 1 (multi-target): TEXT / VISUAL / VISUAL+LABEL -----
+                        img_ids_list.append(img_idx)
+                        gt_category_ids_list.append(cat_id)
+
+                        is_text_only = random.random() < self.text_only_prob
+                        if is_text_only:
+                            # TEXT: text="car", no box, no points, all targets
+                            query_types_list.append(0)  # TEXT
+                            is_visual_query_list.append(False)
+                            text_ids_list.append(_get_text_id(cat_name))
+                            geo_boxes_list.append(None)
+                            geo_points_list.append(None)
+                            geo_point_labels_list.append(None)
+                        else:
+                            # Box-based o2m query
+                            has_label = random.random() < self.use_label_prob
+                            if has_label:
+                                # VISUAL+LABEL: text="visual: car", box, all targets
+                                query_types_list.append(3)  # VISUAL+LABEL
+                                vl_text = f"{self.visual_query_str}: {cat_name}"
+                                text_ids_list.append(_get_text_id(vl_text))
+                            else:
+                                # VISUAL: text="visual", box, all targets
+                                query_types_list.append(1)  # VISUAL
+                                text_ids_list.append(_get_text_id(self.visual_query_str))
+                            is_visual_query_list.append(True)
+                            _, geo_cxcywh = _make_geo_box(box_indices)
+                            geo_boxes_list.append(geo_cxcywh)
+                            # Branch 1 visual: no point prompts (box only)
+                            geo_points_list.append(None)
+                            geo_point_labels_list.append(None)
+
+                        # Targets: ALL boxes of this category (multi-target)
+                        query_gt_boxes2d = []
+                        query_gt_boxes3d = []
+                        for box_idx in box_indices:
+                            query_gt_boxes2d.append(normalize_box_xyxy(boxes2d[box_idx]))
+                            if boxes3d is not None and box_idx < len(boxes3d):
+                                query_gt_boxes3d.append(boxes3d[box_idx].to(device))
+                        gt_boxes2d_per_query.append(query_gt_boxes2d)
+                        gt_boxes3d_per_query.append(query_gt_boxes3d if query_gt_boxes3d else None)
+                        # Collect ignore boxes for this category
+                        ign_indices = cat_to_ignore_indices.get(cat_id, [])
+                        query_ign = [normalize_box_xyxy(ignore_boxes2d_raw[i]) for i in ign_indices] if ign_indices and ignore_boxes2d_raw is not None else []
+                        ignore_boxes2d_per_query.append(query_ign)
+
+                        # ----- Branch 2 (single-target): GEOMETRY / GEOMETRY+LABEL -----
+                        img_ids_list.append(img_idx)
+                        gt_category_ids_list.append(cat_id)
+
+                        has_label_b2 = random.random() < self.use_label_prob
+                        if has_label_b2:
+                            # GEOMETRY+LABEL: text="geometric: car", 1 target
+                            query_types_list.append(4)  # GEOMETRY+LABEL
+                            gl_text = f"{self.geometric_query_str}: {cat_name}"
+                            text_ids_list.append(_get_text_id(gl_text))
+                        else:
+                            # GEOMETRY: text="geometric", 1 target
+                            query_types_list.append(2)  # GEOMETRY
+                            text_ids_list.append(_get_text_id(self.geometric_query_str))
+                        is_visual_query_list.append(True)
+
+                        selected_idx, geo_cxcywh = _make_geo_box(box_indices)
+
+                        # Decide geometric prompt mode for Branch 2
+                        if self.use_point_prompts:
+                            # Exclusive mode: box OR point, never both
+                            masks2d = sample.get(
+                                "masks2d", None
+                            )
+                            has_mask = (
+                                masks2d is not None
+                                and selected_idx < len(masks2d)
+                                and masks2d[selected_idx].sum() > 0
+                            )
+                            use_pt = (
+                                has_mask
+                                and random.random()
+                                < self.point_mode_prob
+                            )
+                            if use_pt:
+                                # Point-only (no box)
+                                sel_mask = masks2d[selected_idx]
+                                if isinstance(
+                                    sel_mask, torch.Tensor
+                                ):
+                                    sel_mask = (
+                                        sel_mask.cpu().numpy()
+                                    )
+                                sel_box = boxes2d[selected_idx]
+                                sel_box_np = (
+                                    sel_box.cpu().numpy()
+                                    if isinstance(
+                                        sel_box, torch.Tensor
+                                    )
+                                    else np.array(sel_box)
+                                )
+                                n_pts = self._sample_num_points(
+                                    self.num_positive_points
+                                )
+                                if n_pts == 1:
+                                    # Single point: always positive
+                                    # from mask center (farthest
+                                    # from edges)
+                                    points = sample_points_from_mask(
+                                        sel_mask,
+                                        1,
+                                        "centered",
+                                    )
+                                else:
+                                    # Multi-point: random_box mode,
+                                    # mask determines pos/neg labels
+                                    points = sample_points_from_mask(
+                                        sel_mask,
+                                        n_pts,
+                                        "random_box",
+                                        sel_box_np,
+                                    )
+                                pts_xy = torch.tensor(
+                                    points[:, :2]
+                                    / np.array([W, H]),
+                                    dtype=torch.float32,
+                                )
+                                pts_labels = torch.tensor(
+                                    points[:, 2],
+                                    dtype=torch.long,
+                                )
+                                geo_boxes_list.append(None)
+                                geo_points_list.append(pts_xy)
+                                geo_point_labels_list.append(
+                                    pts_labels
+                                )
+                            else:
+                                # Box-only (no points)
+                                geo_boxes_list.append(geo_cxcywh)
+                                geo_points_list.append(None)
+                                geo_point_labels_list.append(None)
+                        else:
+                            geo_boxes_list.append(geo_cxcywh)
+                            geo_points_list.append(None)
+                            geo_point_labels_list.append(None)
+
+                        # Target: ONLY the selected box (single-target)
+                        query_gt_boxes2d = [normalize_box_xyxy(boxes2d[selected_idx])]
+                        query_gt_boxes3d = []
+                        if boxes3d is not None and selected_idx < len(boxes3d):
+                            query_gt_boxes3d.append(boxes3d[selected_idx].to(device))
+                        gt_boxes2d_per_query.append(query_gt_boxes2d)
+                        gt_boxes3d_per_query.append(query_gt_boxes3d if query_gt_boxes3d else None)
+                        # Same ignore boxes as Branch 1 (same category)
+                        ign_indices = cat_to_ignore_indices.get(cat_id, [])
+                        query_ign = [normalize_box_xyxy(ignore_boxes2d_raw[i]) for i in ign_indices] if ign_indices and ignore_boxes2d_raw is not None else []
+                        ignore_boxes2d_per_query.append(query_ign)
+
+                    else:
+                        # ========== Original: Text/Visual random selection ==========
+                        img_ids_list.append(img_idx)
+                        gt_category_ids_list.append(cat_id)
+
+                        # Decide query type: text-only or visual
+                        is_text_query = random.random() < self.text_query_prob
+                        is_visual_query = not is_text_query
+
+                        # Track query type (0=TEXT for both text and visual in original mode)
+                        query_types_list.append(0 if is_text_query else 1)  # 1=VISUAL
+                        is_visual_query_list.append(is_visual_query)
+
+                        # Determine text for this query
+                        if is_visual_query and not self.keep_text_for_visual:
+                            text = "visual"
+                        else:
+                            text = cat_name
+
+                        if text not in text_to_id:
+                            text_to_id[text] = len(unique_texts)
+                            unique_texts.append(text)
+                        text_ids_list.append(text_to_id[text])
+
+                        # Visual query: pick one target as geo_box
+                        if is_visual_query and self.use_box_prompts:
+                            selected_idx = random.choice(box_indices)
+                            box_xyxy = boxes2d[selected_idx]
+                            box_xyxy_np = box_xyxy.cpu().numpy() if isinstance(box_xyxy, torch.Tensor) else box_xyxy
+
+                            std = self._sample_box_noise_std()
+                            if std > 0:
+                                box_xyxy_np = noise_box(
+                                    box_xyxy_np,
+                                    im_size=(H, W),
+                                    box_noise_std=std,
+                                    box_noise_max=self.box_noise_max,
+                                )
+
+                            box_norm_xyxy = torch.tensor([
+                                box_xyxy_np[0] / W,
+                                box_xyxy_np[1] / H,
+                                box_xyxy_np[2] / W,
+                                box_xyxy_np[3] / H,
+                            ], dtype=torch.float32, device=device)
+                            geo_boxes_list.append(xyxy_to_cxcywh(box_norm_xyxy))
+                        else:
+                            geo_boxes_list.append(None)
+                        # Legacy mode: no point prompts
+                        geo_points_list.append(None)
+                        geo_point_labels_list.append(None)
+
+                        # Multi-instance targets: ALL boxes of this category
+                        query_gt_boxes2d = []
+                        query_gt_boxes3d = []
+                        for box_idx in box_indices:
+                            query_gt_boxes2d.append(normalize_box_xyxy(boxes2d[box_idx]))
+                            if boxes3d is not None and box_idx < len(boxes3d):
+                                query_gt_boxes3d.append(boxes3d[box_idx].to(device))
+                        gt_boxes2d_per_query.append(query_gt_boxes2d)
+                        gt_boxes3d_per_query.append(query_gt_boxes3d if query_gt_boxes3d else None)
+                        # Collect ignore boxes for this category
+                        ign_indices = cat_to_ignore_indices.get(cat_id, [])
+                        query_ign = [normalize_box_xyxy(ignore_boxes2d_raw[i]) for i in ign_indices] if ign_indices and ignore_boxes2d_raw is not None else []
+                        ignore_boxes2d_per_query.append(query_ign)
+
+                # ========== Negative sampling (SAM3 style) ==========
+                # Add TEXT queries for absent categories (num_gts=0).
+                # These train the presence head to predict "not present".
+                # SAM3 does this via COCO_FROM_JSON include_negatives=True.
+                if (
+                    self.include_negatives
+                    and class_names is not None
+                    and 0 < len(class_names) <= 100
+                ):
+                    present_cats = set(cat_to_box_indices.keys())
+                    all_cats = set(range(len(class_names)))
+                    absent_cats = list(all_cats - present_cats)
+
+                    if len(absent_cats) > self.max_negatives_per_image:
+                        absent_cats = random.sample(
+                            absent_cats, self.max_negatives_per_image
+                        )
+
+                    for neg_cat_id in absent_cats:
+                        neg_cat_name = class_names[neg_cat_id]
+                        img_ids_list.append(img_idx)
+                        gt_category_ids_list.append(neg_cat_id)
+                        query_types_list.append(0)  # TEXT (exhaustive)
+                        is_visual_query_list.append(False)
+                        if neg_cat_name not in text_to_id:
+                            text_to_id[neg_cat_name] = len(unique_texts)
+                            unique_texts.append(neg_cat_name)
+                        text_ids_list.append(text_to_id[neg_cat_name])
+                        geo_boxes_list.append(None)
+                        geo_points_list.append(None)
+                        geo_point_labels_list.append(None)
+                        gt_boxes2d_per_query.append([])
+                        gt_boxes3d_per_query.append(None)
+                        ignore_boxes2d_per_query.append([])
+
+        profile_stop("  collator_category_group")
+
+        N_prompts = len(img_ids_list)
+
+        if N_prompts == 0:
+            import torch.distributed as dist
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            print(
+                f"[WildDet3DCollator] WARNING: Unexpected N_prompts=0 "
+                f"(B={B} images passed filter) on rank {rank}"
+            )
+            return WildDet3DInput(
+                images=images,
+                intrinsics=intrinsics,
+                img_ids=torch.zeros(0, dtype=torch.long, device=device),
+                text_ids=torch.zeros(0, dtype=torch.long, device=device),
+                unique_texts=[self.default_text],
+                sample_names=sample_names,
+                dataset_name=dataset_name,
+                original_hw=original_hw,
+                original_images=original_images,
+                original_intrinsics=original_intrinsics,
+                padding=padding,
+            )
+
+        # Stack tensors
+        profile_start("  collator_tensor_stack")
+        img_ids = torch.tensor(img_ids_list, dtype=torch.long, device=device)
+        text_ids = torch.tensor(text_ids_list, dtype=torch.long, device=device)
+
+        # ========== Box prompts for visual queries ==========
+        # geo_boxes: (N_prompts, 1, 4) - None for text-only queries
+        geo_boxes = None
+        geo_boxes_mask = None
+        geo_box_labels = None
+
+        # Check if any visual queries exist
+        has_visual = any(g is not None for g in geo_boxes_list)
+        if has_visual:
+            # Stack geo_boxes, use zeros for text-only queries
+            stacked_geo_boxes = []
+            for g in geo_boxes_list:
+                if g is not None:
+                    stacked_geo_boxes.append(g)
+                else:
+                    stacked_geo_boxes.append(torch.zeros(4, device=device))
+            geo_boxes = torch.stack(stacked_geo_boxes).unsqueeze(1)  # (N, 1, 4)
+
+            # Mask: True = padding (i.e., text-only queries have no valid box)
+            geo_boxes_mask = torch.tensor(
+                [[g is None] for g in geo_boxes_list],
+                dtype=torch.bool, device=device
+            )  # (N, 1)
+
+            # Labels: 1 for positive (valid) boxes
+            geo_box_labels = torch.tensor(
+                [[1 if g is not None else 0] for g in geo_boxes_list],
+                dtype=torch.long, device=device
+            )  # (N, 1)
+
+        # ========== Point prompts: pad to (N_prompts, max_P, 2) ==========
+        geo_points = None
+        geo_points_mask = None
+        geo_point_labels = None
+        has_points = any(p is not None for p in geo_points_list)
+        if has_points:
+            max_P = max(
+                len(p) for p in geo_points_list if p is not None
+            )
+            if max_P > 0:
+                pts_padded = []
+                pts_mask_list = []
+                pts_labels_padded = []
+                for pts, lbls in zip(
+                    geo_points_list, geo_point_labels_list
+                ):
+                    if pts is None or len(pts) == 0:
+                        pts_padded.append(
+                            torch.zeros(max_P, 2, device=device)
+                        )
+                        pts_mask_list.append(
+                            torch.ones(max_P, dtype=torch.bool, device=device)
+                        )
+                        pts_labels_padded.append(
+                            torch.zeros(max_P, dtype=torch.long, device=device)
+                        )
+                    else:
+                        n = len(pts)
+                        pad_n = max_P - n
+                        pts_padded.append(torch.cat([
+                            pts.to(device),
+                            torch.zeros(pad_n, 2, device=device),
+                        ]))
+                        pts_mask_list.append(torch.cat([
+                            torch.zeros(n, dtype=torch.bool, device=device),
+                            torch.ones(pad_n, dtype=torch.bool, device=device),
+                        ]))
+                        pts_labels_padded.append(torch.cat([
+                            lbls.to(device),
+                            torch.zeros(pad_n, dtype=torch.long, device=device),
+                        ]))
+                geo_points = torch.stack(pts_padded)          # (N, max_P, 2)
+                geo_points_mask = torch.stack(pts_mask_list)   # (N, max_P)
+                geo_point_labels = torch.stack(pts_labels_padded)  # (N, max_P)
+
+        # ========== Multi-instance GT boxes: pad to (N_prompts, max_gt, 4) ==========
+        # Find max number of targets per query (at least 1 for tensor shape)
+        max_gt = max(
+            (len(q) for q in gt_boxes2d_per_query), default=1
+        )
+        max_gt = max(max_gt, 1)  # Ensure at least 1 for padded tensor shape
+        num_gts_list = []
+
+        gt_boxes2d_padded = []
+        for query_boxes in gt_boxes2d_per_query:
+            n_gt = len(query_boxes)
+            num_gts_list.append(n_gt)
+
+            if n_gt == 0:
+                # Negative query: all-zero padding, num_gts=0
+                padded = [torch.zeros(4, device=device)] * max_gt
+            elif n_gt < max_gt:
+                # Pad with zeros
+                padded = query_boxes + [torch.zeros(4, device=device)] * (max_gt - n_gt)
+            else:
+                padded = query_boxes
+            gt_boxes2d_padded.append(torch.stack(padded))
+
+        gt_boxes2d = torch.stack(gt_boxes2d_padded)  # (N_prompts, max_gt, 4)
+        num_gts = torch.tensor(num_gts_list, dtype=torch.long, device=device)  # (N_prompts,)
+
+        # 3D boxes (if available)
+        gt_boxes3d = None
+        if any(q is not None for q in gt_boxes3d_per_query):
+            # Get 3D box dimension from first valid entry
+            box3d_dim = None
+            for q in gt_boxes3d_per_query:
+                if q is not None and len(q) > 0:
+                    box3d_dim = q[0].shape[-1]
+                    break
+
+            if box3d_dim is not None:
+                gt_boxes3d_padded = []
+                for query_boxes in gt_boxes3d_per_query:
+                    if query_boxes is None or len(query_boxes) == 0:
+                        # No 3D boxes for this query
+                        padded = [torch.zeros(box3d_dim, device=device)] * max_gt
+                    else:
+                        n_gt = len(query_boxes)
+                        if n_gt < max_gt:
+                            padded = query_boxes + [torch.zeros(box3d_dim, device=device)] * (max_gt - n_gt)
+                        else:
+                            padded = query_boxes
+                    gt_boxes3d_padded.append(torch.stack(padded))
+                gt_boxes3d = torch.stack(gt_boxes3d_padded)  # (N_prompts, max_gt, box3d_dim)
+
+        gt_category_ids = torch.tensor(gt_category_ids_list, dtype=torch.long, device=device)
+
+        # ========== Ignore boxes: pad to (N_prompts, max_ignore, 4) ==========
+        max_ignore = max(
+            (len(q) for q in ignore_boxes2d_per_query), default=0
+        )
+        if max_ignore > 0:
+            num_ignores_list = []
+            ignore_padded = []
+            for q in ignore_boxes2d_per_query:
+                n_ign = len(q)
+                num_ignores_list.append(n_ign)
+                if n_ign < max_ignore:
+                    padded = q + [
+                        torch.zeros(4, device=device)
+                    ] * (max_ignore - n_ign)
+                else:
+                    padded = q
+                ignore_padded.append(torch.stack(padded))
+            ignore_boxes2d_tensor = torch.stack(ignore_padded)
+            num_ignores_tensor = torch.tensor(
+                num_ignores_list, dtype=torch.long, device=device
+            )
+        else:
+            ignore_boxes2d_tensor = None
+            num_ignores_tensor = None
+
+        # Query types: 0=TEXT, 1=VISUAL, 2=GEOMETRY
+        query_types = torch.tensor(query_types_list, dtype=torch.long, device=device)
+        profile_stop("  collator_tensor_stack")
+        profile_stop("  collator_total")
+
+        return WildDet3DInput(
+            images=images,
+            intrinsics=intrinsics,
+            img_ids=img_ids,
+            text_ids=text_ids,
+            unique_texts=unique_texts,
+            geo_boxes=geo_boxes,
+            geo_boxes_mask=geo_boxes_mask,
+            geo_box_labels=geo_box_labels,
+            geo_points=geo_points,
+            geo_points_mask=geo_points_mask,
+            geo_point_labels=geo_point_labels,
+            gt_boxes2d=gt_boxes2d,
+            gt_boxes3d=gt_boxes3d,
+            num_gts=num_gts,
+            gt_category_ids=gt_category_ids,
+            ignore_boxes2d=ignore_boxes2d_tensor,
+            num_ignores=num_ignores_tensor,
+            query_types=query_types,
+            # Metadata for evaluation/visualization
+            sample_names=sample_names,
+            dataset_name=dataset_name,
+            original_hw=original_hw,
+            original_images=original_images,
+            original_intrinsics=original_intrinsics,
+            padding=padding,
+            # Depth ground truth for geometry backend supervision
+            depth_gt=depth_gt,
+            depth_mask=None,  # Not yet implemented
+        )
+
+
+# ============================================================================
+# WildDet3D Specific Connectors
+# ============================================================================
+
+# Training connector for WildDet3D
+# Note: SAM3 uses geometric prompts (boxes/points) instead of text
+CONN_WILDDET3D_TRAIN = {
+    "images": K.images,
+    "input_hw": K.input_hw,
+    # Geometric prompts (boxes as prompts)
+    "prompt_boxes": K.boxes2d,  # Use GT boxes as prompts during training
+    "prompt_box_labels": K.boxes2d_classes,
+    # Targets
+    "boxes2d": K.boxes2d,
+    "boxes2d_classes": K.boxes2d_classes,
+    "boxes3d": K.boxes3d,
+    # Camera
+    "intrinsics": K.intrinsics,
+    # Depth for geometry backend
+    "depth_gt": K.depth_maps,
+}
+
+# Test connector for WildDet3D
+CONN_WILDDET3D_TEST = {
+    "images": K.images,
+    "input_hw": K.input_hw,
+    "original_hw": K.original_hw,
+    # Geometric prompts (from external detector or user input)
+    "prompt_boxes": K.boxes2d,  # External 2D detections as prompts
+    # Camera
+    "intrinsics": K.intrinsics,
+    "padding": "padding",
+}
+
+# Loss connector for WildDet3D
+CONN_WILDDET3D_LOSS = {
+    # Model outputs
+    "pred_logits": pred_key("pred_logits"),
+    "pred_boxes_2d": pred_key("pred_boxes_2d"),
+    "pred_boxes_3d": pred_key("pred_boxes_3d"),
+    "aux_outputs": pred_key("aux_outputs"),
+    "geom_losses": pred_key("geom_losses"),
+    # Matching indices (computed by model)
+    "indices": pred_key("indices"),
+    # Targets
+    "targets": {
+        "boxes": data_key(K.boxes2d),
+        "boxes_xyxy": data_key(K.boxes2d),  # Will be converted
+        "boxes_3d": data_key(K.boxes3d),
+        "num_boxes": data_key("num_boxes"),
+        "image_size": data_key(K.input_hw),  # (H, W) for pixel coordinate conversion
+    },
+    # Camera
+    "intrinsics": data_key(K.intrinsics),
+    # Image size for pixel coordinate conversion (following GDino3D)
+    "image_size": data_key(K.input_hw),
+}
+
+# Evaluation connector
+CONN_WILDDET3D_EVAL = {
+    "coco_image_id": data_key(K.sample_names),
+    "pred_boxes": pred_key("boxes"),
+    "pred_scores": pred_key("scores"),
+    "pred_classes": pred_key("class_ids"),
+    "pred_boxes3d": pred_key("boxes3d"),
+}
+
+# Visualization connector
+CONN_WILDDET3D_VIS = {
+    "images": data_key(K.original_images),
+    "image_names": data_key(K.sample_names),
+    "intrinsics": data_key("original_intrinsics"),
+    "boxes3d": pred_key("boxes3d"),
+    "class_ids": pred_key("class_ids"),
+    "scores": pred_key("scores"),
+}
+
+
+class WildDet3DPassthroughConnector:
+    """Data connector that passes WildDet3DInput directly to model.
+
+    Since WildDet3DCollator already produces WildDet3DInput with all needed
+    data, we just pass it through as the 'batch' parameter to model.forward().
+
+    This bypasses the key_mapping approach used by vis4d's DataConnector,
+    which expects raw DataLoader output format.
+    """
+
+    def __call__(self, data: WildDet3DInput) -> dict:
+        """Pass batch directly to model.
+
+        Args:
+            data: WildDet3DInput from collator
+
+        Returns:
+            Dict with 'batch' key pointing to the input data
+        """
+        return {"batch": data}
+
+
+class WildDet3DLossConnector:
+    """Loss connector that passes model output and batch directly to loss.
+
+    Similar to WildDet3DPassthroughConnector, this bypasses vis4d's key_mapping
+    since WildDet3DLoss expects structured objects (WildDet3DOut, WildDet3DInput).
+
+    This connector is used with LossModule to enable proper wandb logging of
+    individual loss components (loss_cls, loss_bbox, loss_giou, etc.).
+    """
+
+    def __call__(self, predictions, batch: WildDet3DInput) -> dict:
+        """Map model output and batch to loss function inputs.
+
+        Args:
+            predictions: WildDet3DOut from model.forward()
+            batch: WildDet3DInput from collator
+
+        Returns:
+            Dict with 'out' and 'batch' keys for WildDet3DLoss.forward()
+        """
+        return {
+            "out": predictions,
+            "batch": batch,
+        }
+
+
+class WildDet3DVisConnector:
+    """Vis connector that extracts from WildDet3DInput for visualization.
+
+    vis4d's CallbackConnector uses dict access (data[key]) which doesn't
+    work with WildDet3DInput dataclass. This connector does the
+    extraction manually.
+
+    Args:
+        score_threshold: Only visualize boxes with score >= this value.
+            Separate from model's score_threshold so evaluation AP is unaffected.
+    """
+
+    def __init__(self, score_threshold: float = 0.0):
+        self.score_threshold = score_threshold
+
+    def __call__(self, prediction, data: WildDet3DInput) -> dict:
+        """Extract visualization data from dataclass + prediction.
+
+        Args:
+            prediction: Det3DOut NamedTuple from model.
+            data: WildDet3DInput from collator.
+
+        Returns:
+            Dict with keys expected by BoundingBox3DVisualizer.
+        """
+        # When the collator filters out images with no GT boxes (empty batch),
+        # original_images is None. Return empty tensor so the visualizer's
+        # for-loop iterates 0 times instead of crashing.
+        images = data.original_images
+        if images is None:
+            images = torch.zeros(0, 3, 1, 1)
+
+        boxes3d = prediction.boxes3d
+        class_ids = prediction.class_ids
+        scores = prediction.scores
+
+        # Filter by score threshold per image for cleaner visualization
+        if self.score_threshold > 0.0 and scores is not None:
+            filtered_boxes3d = []
+            filtered_class_ids = []
+            filtered_scores = []
+            for i in range(len(scores)):
+                mask = scores[i] >= self.score_threshold
+                filtered_scores.append(scores[i][mask])
+                filtered_class_ids.append(class_ids[i][mask])
+                filtered_boxes3d.append(boxes3d[i][mask])
+            boxes3d = filtered_boxes3d
+            class_ids = filtered_class_ids
+            scores = filtered_scores
+
+        # Cast to float32 for numpy compatibility (bf16 not supported)
+        if scores is not None:
+            scores = [s.float() for s in scores]
+        if boxes3d is not None:
+            boxes3d = [b.float() for b in boxes3d]
+
+        intrinsics = data.original_intrinsics
+        if intrinsics is not None:
+            intrinsics = intrinsics.float()
+
+        return {
+            "images": images,
+            "image_names": data.sample_names,
+            "intrinsics": intrinsics,
+            "boxes3d": boxes3d,
+            "class_ids": class_ids,
+            "scores": scores,
+        }
+
+
+class WildDet3DEvalConnector:
+    """Eval connector that extracts from WildDet3DInput for evaluator.
+
+    Same issue as WildDet3DVisConnector: CallbackConnector doesn't work with
+    dataclass. This connector manually extracts fields.
+    """
+
+    def __call__(self, prediction, data: WildDet3DInput) -> dict:
+        """Extract evaluation data from dataclass + prediction.
+
+        Args:
+            prediction: Det3DOut NamedTuple from model.
+            data: WildDet3DInput from collator.
+
+        Returns:
+            Dict with keys expected by Omni3DEvaluator.
+        """
+        return {
+            "coco_image_id": data.sample_names,
+            "dataset_names": data.dataset_name,
+            "pred_boxes": prediction.boxes,
+            "pred_scores": prediction.scores,
+            "pred_classes": prediction.class_ids,
+            "pred_boxes3d": prediction.boxes3d,
+        }
+
+
+class WildDet3DDetect3DEvalConnector:
+    """Eval connector for Detect3DEvaluator with WildDet3DInput.
+
+    Unlike WildDet3DEvalConnector, this connector does not include dataset_names
+    since Detect3DEvaluator.process_batch does not accept that argument.
+    """
+
+    def __call__(self, prediction, data: WildDet3DInput) -> dict:
+        """Extract evaluation data from dataclass + prediction.
+
+        Args:
+            prediction: Det3DOut NamedTuple from model.
+            data: WildDet3DInput from collator.
+
+        Returns:
+            Dict with keys expected by Detect3DEvaluator.process_batch.
+        """
+        return {
+            "coco_image_id": data.sample_names,
+            "pred_boxes": prediction.boxes,
+            "pred_scores": prediction.scores,
+            "pred_classes": prediction.class_ids,
+            "pred_boxes3d": prediction.boxes3d,
+        }
+
+
+def get_wilddet3d_data_connector_cfg() -> tuple[ConfigDict, ConfigDict]:
+    """Get WildDet3D data connector configuration.
+
+    Returns:
+        Tuple of (train_connector, test_connector).
+
+    Note:
+        Uses WildDet3DPassthroughConnector which passes the collated batch
+        directly to model.forward(batch=...), rather than mapping individual
+        keys like standard vis4d DataConnector.
+    """
+    train_data_connector = class_config(WildDet3DPassthroughConnector)
+    test_data_connector = class_config(WildDet3DPassthroughConnector)
+
+    return train_data_connector, test_data_connector
+
+
+def get_wilddet3d_collator_cfg(
+    max_prompts_per_image: int = 50,
+    use_text_prompts: bool = True,
+    # Point prompt options (for ablation)
+    use_point_prompts: bool = False,
+    num_positive_points: int | tuple[int, int] = 1,
+    num_negative_points: int | tuple[int, int] = 0,
+    point_sample_mode: Literal["centered", "random_mask", "random_box"] = "random_mask",
+    # Box prompt options
+    use_box_prompts: bool = True,
+    box_noise_std: float = 0.0,
+    box_noise_max: float | None = 20.0,
+    # Text/Visual query ratio (SAM3 original design)
+    text_query_prob: float = 0.7,
+    keep_text_for_visual: bool = False,
+) -> ConfigDict:
+    """Get WildDet3D collator configuration.
+
+    The collator converts per-image DataLoader output to WildDet3DInput.
+    Following SAM3 original design: per-category queries with multi-instance targets.
+
+    Args:
+        max_prompts_per_image: Max prompts (categories) per image
+        use_text_prompts: Whether to include text with geometric prompts
+        use_point_prompts: Whether to sample point prompts (for ablation)
+        num_positive_points: Number of positive points to sample
+            Can be int or (min, max) tuple for random range
+        num_negative_points: Number of negative points to sample
+            Can be int or (min, max) tuple for random range
+        point_sample_mode: How to sample points when mask is available
+            - "centered": sample from mask center (farthest from edges)
+            - "random_mask": uniform sample from mask interior
+            - "random_box": uniform sample from box, label from mask
+        use_box_prompts: Whether to use box prompts
+        box_noise_std: Noise std for box jittering (0 = no noise)
+        box_noise_max: Max noise in pixels
+        text_query_prob: Probability of text-only queries (SAM3 recommended: 0.7)
+            1.0 = all text queries (pure text training)
+            0.7 = 70% text, 30% visual (SAM3 mixed training)
+            0.0 = all visual queries (DetAny3D style)
+        keep_text_for_visual: If True, visual queries keep category text
+            If False (default), visual queries use "visual" as text
+
+    Returns:
+        Collator configuration
+    """
+    return class_config(
+        WildDet3DCollator,
+        max_prompts_per_image=max_prompts_per_image,
+        use_text_prompts=use_text_prompts,
+        use_point_prompts=use_point_prompts,
+        num_positive_points=num_positive_points,
+        num_negative_points=num_negative_points,
+        point_sample_mode=point_sample_mode,
+        use_box_prompts=use_box_prompts,
+        box_noise_std=box_noise_std,
+        box_noise_max=box_noise_max,
+        text_query_prob=text_query_prob,
+        keep_text_for_visual=keep_text_for_visual,
+    )
